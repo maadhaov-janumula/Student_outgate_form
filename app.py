@@ -25,7 +25,7 @@ import mimetypes
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DB_PATH = os.getenv("DB_PATH", "leave.db")
-STUDENTS_CSV_PATH = os.getenv("STUDENTS_CSV_PATH", "students_master_data.csv")
+STUDENTS_CSV_PATH = os.getenv("STUDENTS_CSV_PATH", "test_data_SOG.xlsx")
 
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(8 * 1024 * 1024)))  # 8 MB default
 MAX_REASON_LEN = 500
@@ -84,12 +84,12 @@ def ext_ok(filename: str) -> bool:
 @st.cache_data(show_spinner=False)
 def load_students_csv(path: str) -> pd.DataFrame:
     try:
-        # Read as strings, strip header whitespace, and replace NaNs with ""
-        df = pd.read_csv(path, dtype=str).fillna("")
+        # Read Excel as strings, normalize headers, and replace NaNs with ""
+        df = pd.read_excel(path, dtype=str).fillna("")
         df.columns = [c.strip() for c in df.columns]
         return df
     except Exception as e:
-        st.error(f"Failed to read students_master_data.csv: {e}")
+        st.error(f"Failed to read Student Master List: {e}")
         return pd.DataFrame()
 
 def ci_get(row: pd.Series, options: list[str], default=""):
@@ -114,20 +114,22 @@ def _name_from_email(email: str) -> str:
 
 def get_student_name(row: pd.Series, fallback_email: str = "") -> str:
     """
-    Build a name using your CSV's actual columns first:
-      - "First Name and Middle Name" + "Last Name"
-      - then common single-field name variants
-      - then generic first/last variants
-      - finally derive from email
+    Build a name using the canonical Student Master List column first, then fall back
+    to legacy variants and finally derive a best-effort name from the email address.
     """
-    # Prefer your real columns first
+    # Prefer the single-field name provided in the master list
+    student_name = str(ci_get(row, ["Student Name"], "")).strip()
+    if student_name:
+        return _normalize_space(student_name)
+
+    # Legacy multi-column variants
     first_middle = str(ci_get(row, ["First Name and Middle Name"], "")).strip()
     last = str(ci_get(row, ["Last Name"], "")).strip()
     if first_middle or last:
         return _normalize_space(f"{first_middle} {last}")
 
-    # Single-field name variants
-    single_variants = ["Student Name", "Full Name", "Name", "Student_Name", "StudentName", "name"]
+    # Single-field name variants from older extracts
+    single_variants = ["Full Name", "Name", "Student_Name", "StudentName", "name"]
     name = str(ci_get(row, single_variants, "")).strip()
     if name:
         return _normalize_space(name)
@@ -181,6 +183,7 @@ def db():
       father_mobile TEXT,
       father_email TEXT,
       mother_name TEXT,
+      mother_email TEXT,
       mother_mobile TEXT,
 
       approve_token_hash TEXT NOT NULL,
@@ -203,7 +206,8 @@ def db():
       error TEXT
     );
     """)
-    # ---- Lightweight migration: ensure admin_review_msgid exists
+    # ---- Lightweight migration: ensure new columns exist
+    _ensure_column(con, "leave_applications", "mother_email", "TEXT")
     _ensure_column(con, "leave_applications", "admin_review_msgid", "TEXT")
     try:
         yield con
@@ -222,16 +226,16 @@ def insert_application(payload: dict, approve_hash: str, reject_hash: str, exp_i
             INSERT INTO leave_applications (
               application_id, status, submitted_at, from_date, to_date, reason, reason_type,
               doc_name, doc_sha256, student_email, student_name, program, semester, section,
-              father_name, father_mobile, father_email, mother_name, mother_mobile,
+              father_name, father_mobile, father_email, mother_name, mother_email, mother_mobile,
               approve_token_hash, reject_token_hash, token_expires_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             payload["application_id"], "PENDING", now_iso,
             payload["from_date"], payload["to_date"], payload["reason"], payload.get("reason_type"),
             payload.get("doc_name"), payload.get("doc_sha256"),
             payload["student_email"], payload["student_name"], payload.get("program"), payload.get("semester"), payload.get("section"),
             payload.get("father_name"), payload.get("father_mobile"), payload.get("father_email"),
-            payload.get("mother_name"), payload.get("mother_mobile"),
+            payload.get("mother_name"), payload.get("mother_email"), payload.get("mother_mobile"),
             approve_hash, reject_hash, exp_iso
         ))
         # Verify persistence immediately
@@ -561,7 +565,7 @@ def send_decision_notifications(a_row: sqlite3.Row, status: str, rejection_note:
         "doc_url": "",  # if you host docs, populate here
         "processed_at": processed_at,
         "parent_name": a_row["father_name"] or a_row["mother_name"] or "Parent",
-        "parent_email": a_row["father_email"] or "",
+        "parent_email": a_row["father_email"] or a_row["mother_email"] or "",
         "parent_mobile": a_row["father_mobile"] or a_row["mother_mobile"] or "",
         "rejection_note": rejection_note or "",
     }
@@ -712,6 +716,7 @@ def submission_form():
     student_email_input = st.text_input("Student Email", key="student_email_input", placeholder="john.doe@student.woxsen.edu.in")
 
     student_row = None
+    student_email_on_file = ''
     if student_email_input and not df.empty:
         # case-insensitive match on email column(s)
         email_cols = [c for c in df.columns if "email" in c.lower()]
@@ -727,20 +732,40 @@ def submission_form():
         st.caption("Enter your university email to auto-fill your details from master data.")
     else:
         # Extract fields with flexible names
-        student_name = get_student_name(student_row, fallback_email=student_email_input)
-        program = ci_get(student_row, ["Program","Course"], "")
+        student_email_on_file = ci_get(student_row, ["Candidate Adress Email"], student_email_input).strip()
+        student_name = get_student_name(student_row, fallback_email=student_email_on_file or student_email_input)
+        program = ci_get(student_row, [ "Course","Programs", "Program"], "")
         semester = ci_get(student_row, ["Semester"], "")
         section = ci_get(student_row, ["Section"], "")
-        father_name = ci_get(student_row, ["Father's Name","Father Name"], "")
-        father_mobile = ci_get(student_row, ["Father Mobile No.","Father Mobile","Father Phone"], "")
-        father_email = ci_get(student_row, ["Father Email","Parent Email"], "")
-        mother_name = ci_get(student_row, ["Mother's Name","Mother Name"], "")
-        mother_mobile = ci_get(student_row, ["Mother Mobile No.","Mother Mobile","Mother Phone"], "")
+        father_name = ci_get(student_row, ["Father Name", "Father's Name"], "")
+        father_mobile = ci_get(student_row, ["Father Mobile Number", "Father Mobile No.", "Father Mobile", "Father Phone"], "")
+        father_email = ci_get(student_row, ["Father Adress Email", "Father Email", "Parent Email"], "")
+        mother_name = ci_get(student_row, ["Mother Name", "Mother's Name"], "")
+        mother_email = ci_get(student_row, ["Mother Address Email"], "")
+        mother_mobile = ci_get(student_row, ["Mother Mobile Number", "Mother Mobile No.", "Mother Mobile", "Mother Phone", "Guardian 2 Mobile No"], "")
 
-        st.write(f"**Name:** {student_name or '—'}")
-        st.write(f"**Course:** {program or '—'}")
-        if father_email or father_mobile:
-            st.write(f"**Parent on file:** {father_name or '—'} • {mask_email(father_email) if father_email else ''} • {mask_phone(father_mobile) if father_mobile else ''}")
+        st.write(f"**Name:** {student_name or '-'}")
+        st.write(f"**Course:** {program or '-'}")
+        display_email = student_email_on_file or student_email_input
+        if display_email:
+            st.write(f"**Email on file:** {display_email}")
+        parent_bits = []
+        if father_name or father_email or father_mobile:
+            parts = [father_name or '-']
+            if father_email:
+                parts.append(mask_email(father_email))
+            if father_mobile:
+                parts.append(mask_phone(father_mobile))
+            parent_bits.append(" | ".join(parts))
+        if mother_name or mother_email or mother_mobile:
+            parts = [mother_name or '-']
+            if mother_email:
+                parts.append(mask_email(mother_email))
+            if mother_mobile:
+                parts.append(mask_phone(mother_mobile))
+            parent_bits.append(" | ".join(parts))
+        if parent_bits:
+            st.write(f"**Parent on file:** {'; '.join(parent_bits)}")
         if DEV_MODE and not student_name:
             st.caption("(dev) Name columns not found; falling back. Available columns: " + ", ".join(student_row.index))
 
@@ -793,6 +818,7 @@ def submission_form():
             else:
                 doc_bytes_for_mail = data
 
+        student_email_final = (student_email_on_file or student_email_input).strip()
         payload = {
             "application_id": application_id,
             "from_date": date_to_text(from_dt),
@@ -804,16 +830,17 @@ def submission_form():
             "doc_url": "",
             "doc_bytes": doc_bytes_for_mail,         # may be None if too large or no file
             "doc_mime": doc_mime if upload is not None else None,
-            "student_email": student_email_input.strip(),
-            "student_name": get_student_name(student_row, fallback_email=student_email_input),
-            "program": ci_get(student_row, ["Program","Course"], ""),
+            "student_email": student_email_final,
+            "student_name": get_student_name(student_row, fallback_email=student_email_final),
+            "program": ci_get(student_row, ["Course","Programs", "Program"], ""),
             "semester": ci_get(student_row, ["Semester"], ""),
             "section": ci_get(student_row, ["Section"], ""),
-            "father_name": ci_get(student_row, ["Father's Name","Father Name"], ""),
-            "father_mobile": ci_get(student_row, ["Father Mobile No.","Father Mobile","Father Phone"], ""),
-            "father_email": ci_get(student_row, ["Father Email","Parent Email"], ""),
-            "mother_name": ci_get(student_row, ["Mother's Name","Mother Name"], ""),
-            "mother_mobile": ci_get(student_row, ["Mother Mobile No.","Mother Mobile","Mother Phone"], ""),
+            "father_name": ci_get(student_row, ["Father Name", "Father's Name"], ""),
+            "father_mobile": ci_get(student_row, ["Father Mobile Number", "Father Mobile No.", "Father Mobile", "Father Phone"], ""),
+            "father_email": ci_get(student_row, ["Father Adress Email", "Father Email", "Parent Email"], ""),
+            "mother_name": ci_get(student_row, ["Mother Name", "Mother's Name"], ""),
+            "mother_email": ci_get(student_row, ["Mother Address Email"], ""),
+            "mother_mobile": ci_get(student_row, ["Mother Mobile Number", "Mother Mobile No.", "Mother Mobile", "Mother Phone"], ""),
         }
 
         approve_token = secrets.token_urlsafe(32)
